@@ -599,6 +599,14 @@ WHERE estado IN ('confirmado', 'enviado', 'pendiente')
 AND fecha_pedido >= CURRENT_DATE - INTERVAL '6 months'  -- Filtro en la consulta
 ORDER BY fecha_pedido DESC;
 
+-- Agregar Índices Hash para búsquedas exactas de campos de estado
+CREATE INDEX idx_productos_estado_hash ON productos USING HASH(estado);
+CREATE INDEX idx_pedidos_estado_hash ON pedidos USING HASH(estado);
+CREATE INDEX idx_pagos_estado_hash ON pagos USING HASH(estado);
+
+CREATE INDEX idx_productos_estado_stock ON productos(estado, stock_disponible) 
+WHERE estado = 'ACTIVO';
+
 -- 2.4 Consulta optimizada 
 SELECT 
     pr.producto_id,
