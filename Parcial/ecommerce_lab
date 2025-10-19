@@ -139,7 +139,7 @@ CREATE OR REPLACE FUNCTION crear_pedido(
 ) RETURNS INTEGER AS $$
 DECLARE
     v_pedido_id INTEGER;
-    v_producto RECORD;
+    v_producto RECORD;--para almacenar temporalmente cada producto extraido del JSONB
     v_stock_actual INTEGER;
     v_precio_actual DECIMAL(10,2);
     v_subtotal DECIMAL(12,2) := 0;
@@ -152,12 +152,13 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM clientes WHERE cliente_id = p_cliente_id) THEN
         RAISE EXCEPTION 'Cliente con ID % no existe', p_cliente_id;
     END IF;
-    v_producto_count := jsonb_array_length(p_productos);
+    v_producto_count := jsonb_array_length(p_productos);  --Obtener la cantidad total de productos en el JSONB usando jsonb_array    
     IF v_producto_count = 0 THEN
         RAISE EXCEPTION 'La lista de productos está vacía';
     END IF;
     -- Validar productos y stock 
     FOR v_producto_index IN 0..v_producto_count - 1 LOOP
+--Extraer datos del producto del array JSONB usando índices directos
         SELECT 
             (p_productos->v_producto_index->>'producto_id')::INTEGER as producto_id,
             (p_productos->v_producto_index->>'cantidad')::INTEGER as cantidad
