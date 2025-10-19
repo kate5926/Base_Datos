@@ -1,0 +1,695 @@
+
+-- LABORATORIO INTEGRADOR: CONTROL DE TRANSACCIONES
+
+-- Seccion 1: DEFINICION DE ESQUEMA
+
+--DROP DATABASE IF EXISTS ecommerce_lab;
+-- CREATE DATABASE ecommerce_lab;
+--\c ecommerce_lab;
+
+CREATE TABLE productos (
+    producto_id SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    descripcion TEXT,
+    precio_unitario DECIMAL(10,2) NOT NULL CHECK (precio_unitario > 0),
+    stock_disponible INTEGER NOT NULL CHECK (stock_disponible >= 0),
+    stock_minimo INTEGER DEFAULT 5,
+    estado BOOLEAN DEFAULT TRUE,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE clientes (
+    cliente_id SERIAL PRIMARY KEY,
+    nombre_completo VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    telefono VARCHAR(20),
+    direccion_envio TEXT,
+    fecha_registro DATE DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE pedidos (
+    pedido_id SERIAL PRIMARY KEY,
+    cliente_id INTEGER REFERENCES clientes(cliente_id),
+    fecha_pedido TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    estado VARCHAR(20) DEFAULT 'pendiente' CHECK (estado IN ('pendiente', 'confirmado', 'enviado', 'cancelado')),
+    monto_total DECIMAL(12,2) DEFAULT 0,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE detalle_pedido (
+    detalle_id SERIAL PRIMARY KEY,
+    pedido_id INTEGER REFERENCES pedidos(pedido_id) ON DELETE CASCADE,
+    producto_id INTEGER REFERENCES productos(producto_id),
+    cantidad INTEGER NOT NULL CHECK (cantidad > 0),
+    precio_unitario DECIMAL(10,2) NOT NULL,
+    subtotal DECIMAL(12,2) NOT NULL
+);
+
+
+CREATE TABLE pagos (
+    pago_id SERIAL PRIMARY KEY,
+    pedido_id INTEGER REFERENCES pedidos(pedido_id),
+    metodo_pago VARCHAR(50) NOT NULL,
+    monto_pagado DECIMAL(12,2) NOT NULL,
+    fecha_pago TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    estado VARCHAR(20) DEFAULT 'procesando' CHECK (estado IN ('procesando', 'aprobado', 'rechazado')),
+    referencia_transaccion VARCHAR(100)
+);
+
+CREATE TABLE historial_stock (
+    registro_id SERIAL PRIMARY KEY,
+    producto_id INTEGER REFERENCES productos(producto_id),
+    tipo_movimiento VARCHAR(10) CHECK (tipo_movimiento IN ('entrada', 'salida', 'ajuste')),
+    cantidad INTEGER NOT NULL,
+    stock_anterior INTEGER NOT NULL,
+    stock_nuevo INTEGER NOT NULL,
+    pedido_id INTEGER REFERENCES pedidos(pedido_id),
+    fecha_movimiento TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    usuario VARCHAR(50) DEFAULT 'sistema'
+);
+
+
+-- INDICES 
+
+-- Indices productos
+CREATE INDEX idx_productos_estado ON productos(estado);
+CREATE INDEX idx_productos_stock ON productos(stock_disponible);
+CREATE INDEX idx_productos_precio ON productos(precio_unitario);
+
+-- Indices pedidos
+CREATE INDEX idx_pedidos_cliente ON pedidos(cliente_id);
+CREATE INDEX idx_pedidos_estado ON pedidos(estado);
+CREATE INDEX idx_pedidos_fecha ON pedidos(fecha_pedido);
+CREATE INDEX idx_pedidos_fecha_estado ON pedidos(fecha_pedido, estado);
+
+-- Indices detalle_pedido
+CREATE INDEX idx_detalle_pedido ON detalle_pedido(pedido_id);
+CREATE INDEX idx_detalle_producto ON detalle_pedido(producto_id);
+CREATE INDEX idx_detalle_pedido_producto ON detalle_pedido(pedido_id, producto_id);
+
+-- Indicespagos
+CREATE INDEX idx_pagos_pedido ON pagos(pedido_id);
+CREATE INDEX idx_pagos_estado ON pagos(estado);
+CREATE INDEX idx_pagos_fecha ON pagos(fecha_pago);
+
+-- Indices para historial_stock
+CREATE INDEX idx_historial_producto ON historial_stock(producto_id);
+CREATE INDEX idx_historial_fecha ON historial_stock(fecha_movimiento);
+CREATE INDEX idx_historial_pedido ON historial_stock(pedido_id);
+CREATE INDEX idx_historial_tipo ON historial_stock(tipo_movimiento);
+
+
+
+-- DATOS DE PRUEBA
+
+-- Insertar productos (10 productos con diferentes niveles de stock)
+INSERT INTO productos (nombre, descripcion, precio_unitario, stock_disponible, stock_minimo) VALUES
+('Laptop Gamer', 'Laptop alta gama para gaming', 2500.00, 15, 5),
+('Smartphone Pro', 'Telefono inteligente ultima generacion', 800.00, 8, 3),
+('Tablet Basic', 'Tablet para uso general', 300.00, 25, 10),
+('Auriculares Inalambricos', 'Auriculares premium noise canceling', 150.00, 2, 5),  -- Stock bajo
+('Teclado Mecanico', 'Teclado RGB para gamers', 120.00, 1, 5),  -- Stock bajo 
+('Monitor 24"', 'Monitor Full HD 144Hz', 350.00, 12, 4),
+('Mouse Gaming', 'Mouse profesional 16000 DPI', 80.00, 30, 8),
+('Impresora Laser', 'Impresora laser monocromatica', 200.00, 5, 3),
+('Smartwatch', 'Reloj inteligente deportivo', 100.00, 1, 5),  -- Stock bajo
+('Camara Web', 'Camara 4K para streaming', 60.00, 18, 6);
+
+-- Insertar clientes (5 clientes)
+INSERT INTO clientes (nombre_completo, email, telefono, direccion_envio) VALUES
+('Juan Perez', 'juan@email.com', '123456789', 'Av. Miraflores 123, Lima, Peru'),
+('Maria Garcia', 'maria@email.com', '987654321', 'Calle Principal 456, Arequipa, Peru'),
+('Carlos Lopez', 'carlos@email.com', '555444333', 'Jr. Los Olivos 789, Trujillo, Peru'),
+('Ana Martinez', 'ana@email.com', '111222333', 'Av. San Jeronimo 321, Cusco, Peru'),
+('Luis Torres', 'luis@email.com', '999888777', 'Calle Nueva 654, Piura, Peru');
+
+/*
+-- Eliminar funciones existentes
+DROP FUNCTION IF EXISTS crear_pedido(INTEGER, JSONB);
+DROP FUNCTION IF EXISTS procesar_pago(INTEGER, VARCHAR, VARCHAR);
+DROP FUNCTION IF EXISTS cancelar_pedido(INTEGER);
+*/
+
+
+-- TAREA 2.1: Función crear_pedido 
+
+CREATE OR REPLACE FUNCTION crear_pedido(
+    p_cliente_id INTEGER,
+    p_productos JSONB
+) RETURNS INTEGER AS $$
+DECLARE
+    v_pedido_id INTEGER;
+    v_producto RECORD;
+    v_stock_actual INTEGER;
+    v_precio_actual DECIMAL(10,2);
+    v_subtotal DECIMAL(12,2) := 0;
+    v_monto_total DECIMAL(12,2) := 0;
+    v_producto_count INTEGER;
+    v_producto_index INTEGER := 0;
+    v_producto_valido BOOLEAN;
+BEGIN
+    -- Verificar que todos los productos existan y esten activos
+    IF NOT EXISTS (SELECT 1 FROM clientes WHERE cliente_id = p_cliente_id) THEN
+        RAISE EXCEPTION 'Cliente con ID % no existe', p_cliente_id;
+    END IF;
+    v_producto_count := jsonb_array_length(p_productos);
+    IF v_producto_count = 0 THEN
+        RAISE EXCEPTION 'La lista de productos está vacía';
+    END IF;
+    -- Validar productos y stock 
+    FOR v_producto_index IN 0..v_producto_count - 1 LOOP
+        SELECT 
+            (p_productos->v_producto_index->>'producto_id')::INTEGER as producto_id,
+            (p_productos->v_producto_index->>'cantidad')::INTEGER as cantidad
+        INTO v_producto;
+
+        -- Verificar que el producto existe y este activo
+        SELECT EXISTS (
+            SELECT 1 FROM productos 
+            WHERE producto_id = v_producto.producto_id AND estado = TRUE
+        ) INTO v_producto_valido;
+
+        IF NOT v_producto_valido THEN
+            RAISE EXCEPTION 'Producto con ID % no existe o no está activo', v_producto.producto_id;
+        END IF;
+
+        -- FOR UPDATE para bloquear filas durante validaciones críticas
+        SELECT stock_disponible INTO v_stock_actual
+        FROM productos 
+        WHERE producto_id = v_producto.producto_id
+        FOR UPDATE;
+
+        -- Validar que haya stock suficiente
+        IF v_stock_actual < v_producto.cantidad THEN
+            RAISE EXCEPTION 'Stock insuficiente para producto ID %. Stock disponible: %, solicitado: %', 
+                v_producto.producto_id, v_stock_actual, v_producto.cantidad;
+        END IF;
+        -- Calcular monto total
+        SELECT precio_unitario INTO v_precio_actual
+        FROM productos WHERE producto_id = v_producto.producto_id;
+        v_subtotal := v_precio_actual * v_producto.cantidad;
+        v_monto_total := v_monto_total + v_subtotal;
+    END LOOP;
+
+    -- Crear registro estado pendiente
+    INSERT INTO pedidos (cliente_id, monto_total, estado)
+    VALUES (p_cliente_id, v_monto_total, 'pendiente')
+    RETURNING pedido_id INTO v_pedido_id;
+
+    -- Procesar cada producto
+    FOR v_producto_index IN 0..v_producto_count - 1 LOOP
+        SELECT 
+            (p_productos->v_producto_index->>'producto_id')::INTEGER as producto_id,
+            (p_productos->v_producto_index->>'cantidad')::INTEGER as cantidad
+        INTO v_producto;
+
+        SELECT precio_unitario INTO v_precio_actual
+        FROM productos WHERE producto_id = v_producto.producto_id;
+        v_subtotal := v_precio_actual * v_producto.cantidad;
+
+        -- Reserve el stock (reduzca el inventario)
+        UPDATE productos 
+        SET stock_disponible = stock_disponible - v_producto.cantidad,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE producto_id = v_producto.producto_id;
+
+        -- Registre los movimientos en el historial de stock
+        INSERT INTO historial_stock (
+            producto_id, tipo_movimiento, cantidad, 
+            stock_anterior, stock_nuevo, pedido_id, usuario
+        )
+        SELECT 
+            v_producto.producto_id, 'salida', v_producto.cantidad,
+            stock_disponible + v_producto.cantidad, stock_disponible,
+            v_pedido_id, 'sistema'
+        FROM productos WHERE producto_id = v_producto.producto_id;
+
+        -- Inserte los detalles del pedido
+        INSERT INTO detalle_pedido (
+            pedido_id, producto_id, cantidad, precio_unitario, subtotal
+        ) VALUES (
+            v_pedido_id, v_producto.producto_id, v_producto.cantidad,
+            v_precio_actual, v_subtotal
+        );
+    END LOOP;
+
+    RETURN v_pedido_id;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        -- En caso de error, se revertirá la transacción externa
+        RAISE NOTICE 'Error en crear_pedido: %', SQLERRM;
+        RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- TAREA 2.2: Funcion procesar_pago 
+CREATE OR REPLACE FUNCTION procesar_pago(
+    p_pedido_id INTEGER,
+    p_metodo_pago VARCHAR(50),
+    p_referencia_transaccion VARCHAR(100)
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_pedido_record RECORD;
+    v_pago_aprobado BOOLEAN;
+    v_detalle RECORD;
+    v_stock_anterior INTEGER;
+BEGIN
+    -- Valide que el pedido exista y este en estado 'pendiente'
+    SELECT * INTO v_pedido_record 
+    FROM pedidos WHERE pedido_id = p_pedido_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pedido con ID % no existe', p_pedido_id;
+    END IF;
+
+    IF v_pedido_record.estado != 'pendiente' THEN
+        RAISE EXCEPTION 'Pedido no está en estado pendiente. Estado actual: %', v_pedido_record.estado;
+    END IF;
+
+    -- Registre el intento de pago 'procesando'
+    INSERT INTO pagos (pedido_id, metodo_pago, monto_pagado, referencia_transaccion, estado)
+    VALUES (p_pedido_id, p_metodo_pago, v_pedido_record.monto_total, p_referencia_transaccion, 'procesando');
+
+    -- Simulacion de  la validación del pago
+    v_pago_aprobado := (random() < 0.7);
+
+    IF v_pago_aprobado THEN
+        -- Si el pago es aprobado
+        UPDATE pagos SET estado = 'aprobado', fecha_pago = CURRENT_TIMESTAMP
+        WHERE pedido_id = p_pedido_id AND referencia_transaccion = p_referencia_transaccion;
+
+        UPDATE pedidos SET estado = 'confirmado', fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE pedido_id = p_pedido_id;
+
+        RETURN TRUE;
+
+    ELSE
+        -- Si el pago es rechazado
+        UPDATE pagos SET estado = 'rechazado'
+        WHERE pedido_id = p_pedido_id AND referencia_transaccion = p_referencia_transaccion;
+
+        UPDATE pedidos SET estado = 'cancelado', fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE pedido_id = p_pedido_id;
+
+        -- Restaure el stock de los productos
+        FOR v_detalle IN 
+            SELECT producto_id, cantidad FROM detalle_pedido WHERE pedido_id = p_pedido_id
+        LOOP
+            SELECT stock_disponible INTO v_stock_anterior
+            FROM productos WHERE producto_id = v_detalle.producto_id FOR UPDATE;
+            
+            UPDATE productos 
+            SET stock_disponible = stock_disponible + v_detalle.cantidad,
+                fecha_actualizacion = CURRENT_TIMESTAMP
+            WHERE producto_id = v_detalle.producto_id;
+
+            -- Registre movimiento de devolucion
+            INSERT INTO historial_stock (
+                producto_id, tipo_movimiento, cantidad, stock_anterior, stock_nuevo, pedido_id, usuario
+            ) VALUES (
+                v_detalle.producto_id, 'entrada', v_detalle.cantidad,
+                v_stock_anterior, v_stock_anterior + v_detalle.cantidad,
+                p_pedido_id, 'sistema'
+            );
+        END LOOP;
+
+        RETURN FALSE;
+    END IF;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Error en procesar_pago: %', SQLERRM;
+        RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- TAREA 2.3: Funcion cancelar_pedido 
+CREATE OR REPLACE FUNCTION cancelar_pedido(p_pedido_id INTEGER) RETURNS BOOLEAN AS $$
+DECLARE
+    v_pedido_record RECORD;
+    v_detalle RECORD;
+    v_stock_anterior INTEGER;
+BEGIN
+    -- Valide que el pedido pueda ser cancelado
+    SELECT * INTO v_pedido_record 
+    FROM pedidos WHERE pedido_id = p_pedido_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pedido con ID % no existe', p_pedido_id;
+    END IF;
+
+    -- Solo si esta en estado 'pendiente' o 'confirmado'
+    IF v_pedido_record.estado NOT IN ('pendiente', 'confirmado') THEN
+        RAISE EXCEPTION 'Pedido no puede ser cancelado. Estado actual: %', v_pedido_record.estado;
+    END IF;
+
+    -- Actualice el estado del pedido a 'cancelado'
+    UPDATE pedidos 
+    SET estado = 'cancelado', fecha_actualizacion = CURRENT_TIMESTAMP
+    WHERE pedido_id = p_pedido_id;
+
+    -- Restaure el stock 
+    FOR v_detalle IN 
+        SELECT producto_id, cantidad FROM detalle_pedido WHERE pedido_id = p_pedido_id
+    LOOP
+        SELECT stock_disponible INTO v_stock_anterior
+        FROM productos WHERE producto_id = v_detalle.producto_id FOR UPDATE;
+        
+        UPDATE productos 
+        SET stock_disponible = stock_disponible + v_detalle.cantidad,
+            fecha_actualizacion = CURRENT_TIMESTAMP
+        WHERE producto_id = v_detalle.producto_id;
+
+        -- Registre los movimientos de devolucion en el historial 
+        INSERT INTO historial_stock (
+            producto_id, tipo_movimiento, cantidad, stock_anterior, stock_nuevo, pedido_id, usuario
+        ) VALUES (
+            v_detalle.producto_id, 'entrada', v_detalle.cantidad,
+            v_stock_anterior, v_stock_anterior + v_detalle.cantidad,
+            p_pedido_id, 'sistema'
+        );
+    END LOOP;
+
+    RETURN TRUE;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Error en cancelar_pedido: %', SQLERRM;
+        RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+--PARTE 3: PRUEBAS DE CONCURRENCIA (5 puntos)
+
+/*-- TAREA 3.1: Competencia por stock limitado
+
+-- CONEXION A 
+BEGIN; --inicia transaccion
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED; --nivel por defecto
+-- Se crea un pedido que intenta comprar 1 unidad del producto id = 5
+SELECT crear_pedido(1, '[{"producto_id": 5, "cantidad": 1}]'::JSONB); 
+
+-- Pausa artificial para dar tiempo a que otra conexiOn (B) intente comprar el mismo stock
+SELECT pg_sleep(10);
+COMMIT;
+
+
+-- CONEXION B (ejecutar en otra sesión mientras A duerme)
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SELECT pg_sleep(2);
+SELECT crear_pedido(2, '[{"producto_id": 5, "cantidad": 1}]'::JSONB);
+COMMIT;
+*/
+
+ --Tarea 3.2: Probar escenario de pago fallido
+ 
+BEGIN;
+
+--ESTADO INICIAL 
+SELECT producto_id, nombre, stock_disponible, precio_unitario 
+FROM productos WHERE producto_id = ;
+
+--CREANDO PEDIDO 
+SELECT crear_pedido(1, '[{"producto_id": 8, "cantidad": 1}]'::JSONB);
+
+--PEDIDO CREADO - STOCK RESERVADO 
+SELECT p.pedido_id, p.estado, p.monto_total, 
+       (SELECT stock_disponible FROM productos WHERE producto_id = 8) as stock_actual
+FROM pedidos p WHERE p.pedido_id = (SELECT MAX(pedido_id) FROM pedidos);
+
+--  detalles del pedido
+SELECT dp.pedido_id, p.nombre, dp.cantidad, dp.precio_unitario, dp.subtotal
+FROM detalle_pedido dp 
+JOIN productos p ON dp.producto_id = p.producto_id
+WHERE dp.pedido_id = (SELECT MAX(pedido_id) FROM pedidos);
+
+-- 4. PROCESANDO PAGO ,forza FALLIDO 
+SELECT procesar_pago(
+    (SELECT MAX(pedido_id) FROM pedidos), 
+    'tarjeta', 
+    'PAGO_FALLIDO_001'
+) as resultado_pago;
+
+-- ESTADO FINAL 
+-- Estado del pedido y pago
+SELECT p.pedido_id, p.estado as estado_pedido, 
+       pa.estado as estado_pago, pa.referencia_transaccion
+FROM pedidos p 
+LEFT JOIN pagos pa ON p.pedido_id = pa.pedido_id
+WHERE p.pedido_id = (SELECT MAX(pedido_id) FROM pedidos);
+
+-- Stock final
+SELECT producto_id, nombre, stock_disponible 
+FROM productos WHERE producto_id = 8;
+
+-- Historial de movimientos
+SELECT tipo_movimiento, cantidad, stock_anterior, stock_nuevo, fecha_movimiento
+FROM historial_stock 
+WHERE pedido_id = (SELECT MAX(pedido_id) FROM pedidos)
+ORDER BY fecha_movimiento;
+
+COMMIT;
+
+---Tarea 3.3: Simular deadlock
+/*-- CONEXIÓN 1 - DEADLOCK SCENARIO
+BEGIN;
+SELECT 'Iniciando - Bloqueando producto 5' as info;
+UPDATE productos SET fecha_actualizacion = NOW() WHERE producto_id = 5;
+SELECT pg_sleep(15);  -- Espera larga para tener tiempo de monitorear
+UPDATE productos SET fecha_actualizacion = NOW() WHERE producto_id = 9;
+COMMIT;
+
+--CONEXION2
+BEGIN;
+SELECT pg_sleep(10);
+SELECT 'Iniciando - Bloqueando producto 9' as info;
+UPDATE productos SET fecha_actualizacion = NOW() WHERE producto_id = 9;
+UPDATE productos SET fecha_actualizacion = NOW() WHERE producto_id = 5;
+COMMIT;
+
+
+-- Ver TODO, no filtrar
+SELECT * FROM pg_stat_activity WHERE state = 'active';
+
+-- Ver TODOS los bloqueos  
+SELECT * FROM pg_locks WHERE relation IS NOT NULL;
+
+*/
+
+--PARTE 4: ANÁLISIS Y OPTIMIZACIÓN (3 puntos)
+--Tarea 4.1: Consultas de monitoreo
+-- 1. Listar todos los pedidos con sus detalles, cliente y productos
+SELECT 
+    p.pedido_id,
+    c.nombre_completo as cliente,
+    p.fecha_pedido,
+    p.estado,
+    p.monto_total,
+    pr.nombre as producto,
+    dp.cantidad,
+    dp.precio_unitario,
+    dp.subtotal
+FROM pedidos p
+JOIN clientes c ON p.cliente_id = c.cliente_id
+JOIN detalle_pedido dp ON p.pedido_id = dp.pedido_id
+JOIN productos pr ON dp.producto_id = pr.producto_id
+ORDER BY p.fecha_pedido DESC;
+
+-- 2. Productos con stock por debajo del mínimo de alerta
+SELECT 
+    producto_id,
+    nombre,
+    stock_disponible,
+    stock_minimo,
+    CASE 
+        WHEN stock_disponible = 0 THEN 'SIN STOCK'
+        WHEN stock_disponible < stock_minimo THEN 'STOCK BAJO'
+        ELSE 'NORMAL'
+    END as estado_alerta
+FROM productos
+WHERE stock_disponible < stock_minimo OR stock_disponible = 0
+ORDER BY stock_disponible ASC;
+
+-- 3. Reporte de ventas por producto
+SELECT 
+    pr.producto_id,
+    pr.nombre as producto,
+    COUNT(dp.detalle_id) as total_ventas,
+    SUM(dp.cantidad) as cantidad_vendida,
+    SUM(dp.subtotal) as monto_total,
+    ROUND(AVG(dp.precio_unitario), 2) as precio_promedio
+FROM productos pr
+LEFT JOIN detalle_pedido dp ON pr.producto_id = dp.producto_id
+LEFT JOIN pedidos p ON dp.pedido_id = p.pedido_id AND p.estado IN ('confirmado', 'enviado')
+GROUP BY pr.producto_id, pr.nombre
+ORDER BY monto_total DESC NULLS LAST;
+
+-- 4. Pedidos cancelados 
+SELECT 
+    p.pedido_id,
+    c.nombre_completo as cliente,
+    p.fecha_pedido,
+    p.fecha_actualizacion as fecha_cancelacion,
+    p.monto_total,
+    pa.estado as estado_pago,
+    CASE 
+        WHEN pa.estado = 'rechazado' THEN 'Pago rechazado'
+        WHEN p.estado = 'cancelado' AND pa.estado IS NULL THEN 'Cancelación manual'
+        ELSE 'Otra razón'
+    END as motivo_cancelacion
+FROM pedidos p
+JOIN clientes c ON p.cliente_id = c.cliente_id
+LEFT JOIN pagos pa ON p.pedido_id = pa.pedido_id
+WHERE p.estado = 'cancelado'
+ORDER BY p.fecha_actualizacion DESC;
+
+-- 5. Historial completo de movimientos de stock de un producto especifico
+SELECT 
+    hs.fecha_movimiento,
+    hs.tipo_movimiento,
+    hs.cantidad,
+    hs.stock_anterior,
+    hs.stock_nuevo,
+    CASE 
+        WHEN hs.pedido_id IS NOT NULL THEN 'Pedido ' || hs.pedido_id
+        ELSE 'ajuste '
+    END as referencia,
+    hs.usuario
+FROM historial_stock hs
+WHERE hs.producto_id = 8
+ORDER BY hs.fecha_movimiento DESC;
+
+
+
+--Tarea 4.2: Análisis de rendimiento
+--1. EXPLAIN ANALYZE
+EXPLAIN ANALYZE
+SELECT 
+    pr.producto_id,
+    pr.nombre as producto,
+    COUNT(dp.detalle_id) as total_ventas,
+    SUM(dp.cantidad) as cantidad_vendida,
+    SUM(dp.subtotal) as monto_total
+FROM productos pr
+LEFT JOIN detalle_pedido dp ON pr.producto_id = dp.producto_id
+LEFT JOIN pedidos p ON dp.pedido_id = p.pedido_id AND p.estado IN ('confirmado', 'enviado')
+GROUP BY pr.producto_id, pr.nombre
+ORDER BY monto_total DESC NULLS LAST;
+
+
+--2. Optimizacion
+
+-- 2.1 Índice compuesto para consultas de ventas frecuentes
+CREATE INDEX idx_detalle_ventas_eficiente ON detalle_pedido(
+    producto_id, 
+    pedido_id
+) INCLUDE (cantidad, subtotal, precio_unitario);
+
+-- 2.2 Índice consultas activas
+CREATE INDEX idx_pedidos_activos_fecha ON pedidos(fecha_pedido DESC, estado, pedido_id) 
+WHERE estado IN ('confirmado', 'enviado', 'pendiente');
+
+--2.3 consultas usar filtro temporal 
+SELECT * FROM pedidos 
+WHERE estado IN ('confirmado', 'enviado', 'pendiente')
+AND fecha_pedido >= CURRENT_DATE - INTERVAL '6 months'  -- Filtro en la consulta
+ORDER BY fecha_pedido DESC;
+
+-- 2.4 Consulta optimizada 
+SELECT 
+    pr.producto_id,
+    pr.nombre as producto,
+    dp_totales.cantidad_vendida,
+    dp_totales.monto_total
+FROM productos pr
+JOIN (
+    SELECT 
+        dp.producto_id,
+        SUM(dp.cantidad) as cantidad_vendida,
+        SUM(dp.subtotal) as monto_total
+    FROM detalle_pedido dp
+    WHERE EXISTS (
+        SELECT 1 FROM pedidos p 
+        WHERE p.pedido_id = dp.pedido_id 
+        AND p.estado IN ('confirmado', 'enviado')
+        AND p.fecha_pedido >= CURRENT_DATE - INTERVAL '12 months'
+    )
+    GROUP BY dp.producto_id
+) dp_totales ON pr.producto_id = dp_totales.producto_id
+ORDER BY dp_totales.monto_total DESC;
+
+
+--Tarea 4.3: Gestión de transacciones
+SELECT 
+    tipo,
+    proceso_id,
+    usuario,
+    estado,
+    duracion,
+    consulta,
+    detalles_adicionales
+FROM (
+    -- TRANSACCIONES ACTIVAS EN EL SISTEMA
+    SELECT 
+        'TRANSACCIÓN ACTIVA' as tipo,
+        pid::text as proceso_id,
+        usename as usuario,
+        state as estado,
+        age(now(), query_start) as duracion,
+        LEFT(query, 40) as consulta,
+        'BD: ' || datname as detalles_adicionales
+    FROM pg_stat_activity 
+    WHERE state != 'idle'
+    AND datname = 'ecommerce_lab'
+    
+    UNION ALL
+    
+    -- BLOQUEOS ACTUALES Y SU DURACIÓN
+    SELECT 
+        CASE 
+            WHEN lock.granted THEN 'BLOQUEO CONCEDIDO'
+            ELSE 'BLOQUEO ESPERANDO'
+        END as tipo,
+        lock.pid::text as proceso_id,
+        activity.usename as usuario,
+        activity.state as estado,
+        age(now(), activity.query_start) as duracion,
+        LEFT(activity.query, 40) as consulta,
+        'Tabla: ' || lock.relation::regclass as detalles_adicionales
+    FROM pg_locks lock
+    JOIN pg_stat_activity activity ON lock.pid = activity.pid
+    WHERE lock.relation IS NOT NULL
+    AND activity.datname = 'ecommerce_lab'
+    
+    UNION ALL
+    
+    -- ESPERANDO POR BLOQUEOS
+    SELECT 
+        'QUERY BLOQUEADO' as tipo,
+        waiting.pid::text as proceso_id,
+        waiting.usename as usuario,
+        'BLOQUEADO' as estado,
+        age(now(), waiting.query_start) as duracion,
+        LEFT(waiting.query, 40) as consulta,
+        'Bloqueado por: ' || blocking.pid::text as detalles_adicionales
+    FROM pg_locks waiting_locks
+    JOIN pg_stat_activity waiting ON waiting_locks.pid = waiting.pid
+    JOIN pg_locks blocking_locks ON waiting_locks.relation = blocking_locks.relation
+        AND waiting_locks.pid != blocking_locks.pid
+    JOIN pg_stat_activity blocking ON blocking_locks.pid = blocking.pid
+    WHERE NOT waiting_locks.granted
+    AND blocking_locks.granted
+    AND waiting.datname = 'ecommerce_lab'
+) AS transacciones_combinadas
+ORDER BY 
+    CASE tipo
+        WHEN 'BLOQUEADO' THEN 1
+        WHEN 'ESPERANDO' THEN 2
+        WHEN 'BLOQUEO CONCEDIDO' THEN 3
+        ELSE 4
+    END,
+    duracion DESC;
